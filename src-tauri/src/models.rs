@@ -304,3 +304,28 @@ pub struct ApiServiceStatus {
     pub last_error: Option<String>,
     pub started_at: Option<u64>,
 }
+
+/// 接码平台（d1jiema）设置：conf/sms_code.json。
+/// token 仅本地存储，API 回显与日志全程脱敏（前 4 位 + ****）。
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct SmsCodeSettings {
+    pub token: String,
+    /// 短信关键词（如 Trae），getPhone/getMsg 必填参数
+    pub keyword: String,
+    /// 卡类型：全部 | 实卡 | 虚卡
+    pub card_type: String,
+    /// 归属地省份（空 = 全部）
+    pub province: String,
+}
+
+impl Default for SmsCodeSettings {
+    fn default() -> Self {
+        Self {
+            token: String::new(),
+            keyword: "Trae".into(),
+            card_type: "全部".into(),
+            province: String::new(),
+        }
+    }
+}

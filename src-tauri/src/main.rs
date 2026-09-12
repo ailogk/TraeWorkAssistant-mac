@@ -146,6 +146,15 @@ fn main() {
             commands::oauth::oauth_get_login_url,
             commands::oauth::oauth_parse_callback,
             commands::oauth::oauth_login,
+            commands::sms_code::sms_code_get_settings,
+            commands::sms_code::sms_code_set_settings,
+            commands::sms_code::sms_code_balance,
+            commands::sms_code::sms_code_get_phone,
+            commands::sms_code::sms_code_get_msg,
+            commands::sms_code::sms_code_release,
+            commands::sms_code::sms_code_block,
+            commands::sms_code::sms_code_send,
+            commands::sms_code::sms_code_query_used,
         ])
         .setup(|app| {
             let state = app.state::<AppState>();

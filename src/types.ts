@@ -1,14 +1,23 @@
-﻿// 与 Rust 端 DTO 对齐的类型定义。注意：Tauri 命令参数默认使用 snake_case，
+// 与 Rust 端 DTO 对齐的类型定义。注意：Tauri 命令参数默认使用 snake_case，
 // 嵌套对象（CheckinOpts / LogsOpts / Settings）的字段必须保持 snake_case。
 
 export type ViewKey =
   | 'dashboard'
   | 'accounts'
+  | 'register-account'
   | 'checkin'
   | 'credits'
   | 'logs'
   | 'api-service'
   | 'settings';
+
+/** 接码平台（d1jiema）设置；token 后端回显为脱敏值（前 4 位 + ****） */
+export interface SmsCodeSettings {
+  token: string;
+  keyword: string;
+  card_type: string;
+  province: string;
+}
 
 export interface EnvStatus {
   installed: boolean;

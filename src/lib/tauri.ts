@@ -1,4 +1,4 @@
-﻿import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   AccountView,
@@ -27,6 +27,7 @@ import type {
   ProxyLogListResult,
   ProxyStatus,
   Settings,
+  SmsCodeSettings,
   UpdateCheckResult,
   UpdateDownloadProgress,
   UsageDayView,
@@ -162,6 +163,25 @@ export const api = {
       invoke('oauth_parse_callback', { callbackUrl }),
     login: (callbackUrl: string, accountName?: string, groupId?: string) =>
       invoke<OAuthLoginResult>('oauth_login', { callbackUrl, accountName, groupId }),
+  },
+  smsCode: {
+    /** 设置读取（token 为脱敏值）；hasToken 由调用方判断 token 非空 */
+    getSettings: () => invoke<SmsCodeSettings>('sms_code_get_settings'),
+    /** 保存设置；token 含 **** 表示未修改 */
+    setSettings: (settings: SmsCodeSettings) =>
+      invoke('sms_code_set_settings', { settings }),
+    /** 余额查询（后端缓存 30s） */
+    balance: () => invoke<number>('sms_code_balance'),
+    /** 取号：phone 省略为随机取号 */
+    getPhone: (phone?: string) => invoke<string>('sms_code_get_phone', { phone }),
+    /** 单次收短信查询；返回含 [尚未收到] 表示未到 */
+    getMsg: (phone: string) => invoke<string>('sms_code_get_msg', { phone }),
+    release: (phone: string) => invoke<string>('sms_code_release', { phone }),
+    block: (phone: string) => invoke<string>('sms_code_block', { phone }),
+    send: (phone: string, toPhone: string, content: string) =>
+      invoke<string>('sms_code_send', { phone, toPhone, content }),
+    /** 历史记录（后端 60s 限频缓存）；返回 [记录行, 是否缓存命中] */
+    queryUsed: () => invoke<[string[], boolean]>('sms_code_query_used'),
   },
   apiServer: {
     start: () => invoke<ApiServiceStatus>('api_server_start'),

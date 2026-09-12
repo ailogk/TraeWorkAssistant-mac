@@ -2,6 +2,7 @@ import { useState } from 'react';
 import {
   LayoutDashboard,
   Users,
+  Smartphone,
   PlayCircle,
   Coins,
   ScrollText,
@@ -25,6 +26,7 @@ export type { ViewKey };
 const NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'dashboard', label: '概览', icon: LayoutDashboard },
   { key: 'accounts', label: '账号管理', icon: Users },
+  { key: 'register-account', label: '注册账号', icon: Smartphone },
   { key: 'checkin', label: '一键签到', icon: PlayCircle },
   { key: 'credits', label: '积分看板', icon: Coins },
   { key: 'api-service', label: 'API 服务', icon: Server },

@@ -7,6 +7,7 @@ import { useAppStore } from './store';
 import { resolveTheme } from './lib/themes';
 import Dashboard from './pages/Dashboard';
 import Accounts from './pages/Accounts';
+import RegisterAccount from './pages/RegisterAccount';
 import Checkin from './pages/Checkin';
 import Credits from './pages/Credits';
 import Logs from './pages/Logs';
@@ -19,6 +20,8 @@ function renderView(view: string) {
       return <Dashboard />;
     case 'accounts':
       return <Accounts />;
+    case 'register-account':
+      return <RegisterAccount />;
     case 'checkin':
       return <Checkin />;
     case 'credits':
