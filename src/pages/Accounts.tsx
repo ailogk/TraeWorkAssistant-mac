@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Plus,
@@ -1642,8 +1642,8 @@ function HelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
             点击账号行的「重置」图标可重置该账号的设备 ID（用于解决设备绑定问题）。
-            如需全局重置 6 层设备标识（machineid、storage.json、aha、注册表 MachineGuid 等），
-            请到设置页面执行「6 层设备标识重置」。
+            如需全局重置全部设备标识层（machineid、storage.json、aha 等），
+            请到设置页面执行「设备标识重置」。
           </p>
         </section>
 

@@ -6,7 +6,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "npm run dev:vite",
-    "beforeBuildCommand": "python scripts/prepare_python_runtime.py && npm run build"
+    "beforeBuildCommand": "python3 scripts/prepare_python_runtime_macos.py && npm run build"
   },
   "app": {
     "windows": [
@@ -29,15 +29,18 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["msi", "nsis"],
-    "icon": ["icons/icon.ico"],
+    "targets": ["app", "dmg"],
+    "icon": ["icons/icon.icns", "icons/icon.ico"],
     "resources": {
       "../build/python-bundle/": "python/",
       "../src-ps/": "ps/"
     },
     "shortDescription": "Trae Work 多账号签到与管理助手",
-    "longDescription": "整合多账号签到、登录态切换、设备隔离与账号分组的 Windows 桌面端工具。",
+    "longDescription": "整合多账号签到、登录态切换、设备隔离与账号分组的桌面端工具（macOS 版）。",
     "publisher": "Trae Work 助手",
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    },
     "windows": {
       "nsis": {
         "template": "windows/installer.nsi",

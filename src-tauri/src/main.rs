@@ -370,7 +370,7 @@ fn main() {
                 rt.handle.stop();
             }
             // 还原系统代理，避免退出后本机全局断网
-            if let Err(e) = commands::proxy::clear_win_proxy() {
+            if let Err(e) = commands::proxy::restore_system_proxy() {
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     fs_utils::app_log(&state.data_dir, &format!("应用退出：还原系统代理失败(可手动关闭): {e}"));
                 }

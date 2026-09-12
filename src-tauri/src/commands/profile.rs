@@ -1,8 +1,6 @@
 use serde::Serialize;
-use std::io::Write;
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
@@ -88,102 +86,24 @@ pub fn profile_list(state: State<AppState>) -> Vec<ProfileInfo> {
     out
 }
 
-/// 备份当前 TRAE 登录态到指定 slot（调用 PowerShell 脚本）
+/// 备份当前 TRAE 登录态到指定 slot（跨平台桥脚本）
 #[tauri::command]
 pub fn profile_backup(
     app: AppHandle,
     state: State<AppState>,
     user_id: String,
 ) -> Result<(), String> {
-    let ps_dir = if let Ok(r) = std::env::var("TAURI_RESOURCE_DIR") {
-        PathBuf::from(r).join("ps")
-    } else {
-        state.python_dir.join("../ps")
-    };
-    let bridge = ps_dir.join("trae-switch-bridge.ps1");
-    if !bridge.exists() {
-        return Err(format!("找不到切换脚本: {}", bridge.display()));
-    }
-
     fs_utils::app_log(&state.data_dir, &format!("开始备份登录态: user_id={user_id}"));
 
-    let mut child = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &bridge.to_string_lossy(),
-            "-Action",
-            "BackupCurrent",
-            "-UserId",
-            &user_id,
-            "-Json",
-        ])
-        .creation_flags(0x08000000)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("启动备份失败: {e}"))?;
-
-    let stdout = child.stdout.take().ok_or("备份脚本无输出")?;
-    let stderr = child.stderr.take();
-    let app2 = app.clone();
-    let data_dir = state.data_dir.clone();
-
-    // stdout 线程：NDJSON -> profile-progress 事件
-    std::thread::spawn(move || {
-        let reader = std::io::BufReader::new(stdout);
-        let mut done_emitted = false;
-        for line in std::io::BufRead::lines(reader) {
-            if let Ok(l) = line {
-                let l = l.trim().to_string();
-                if l.is_empty() {
-                    continue;
-                }
-                let _ = app2.emit("profile-progress", &l);
-                if l.contains("\"stage\":\"done\"") || l.contains("\"stage\":\"fatal\"") {
-                    let success = l.contains("\"stage\":\"done\"");
-                    done_emitted = true;
-                    let _ = app2.emit(
-                        "profile-done",
-                        serde_json::json!({ "success": success, "raw": l, "action": "backup" }),
-                    );
-                }
-            }
-        }
-        let exit_status = child.wait();
-        if !done_emitted {
-            let success = matches!(&exit_status, Ok(s) if s.success());
-            let _ = app2.emit(
-                "profile-done",
-                serde_json::json!({ "success": success, "raw": format!("exit: {:?}", exit_status), "action": "backup" }),
-            );
-        }
-    });
-
-    // stderr 线程
-    if let Some(stderr) = stderr {
-        std::thread::spawn(move || {
-            let log_path = data_dir.join("logs").join("switcher.log");
-            let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
-            let reader = std::io::BufReader::new(stderr);
-            for line in std::io::BufRead::lines(reader) {
-                if let Ok(l) = line {
-                    let l = format!("[stderr] {}", l.trim());
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&log_path)
-                    {
-                        let _ = std::writeln!(f, "[{}] {}", fs_utils::now_ts(), l);
-                    }
-                }
-            }
-        });
-    }
-
-    Ok(())
+    crate::commands::bridge::run_bridge_async(
+        &app,
+        &state.data_dir,
+        "BackupCurrent",
+        Some(&user_id),
+        "profile-progress",
+        "profile-done",
+        Some(serde_json::json!({ "action": "backup" })),
+    )
 }
 
 /// 恢复指定 slot 的登录态（关闭 TRAE → 恢复 → 启动 TRAE）
@@ -199,93 +119,17 @@ pub fn profile_restore(
         return Err(format!("账号 {} 的登录态快照不存在", user_id));
     }
 
-    let ps_dir = if let Ok(r) = std::env::var("TAURI_RESOURCE_DIR") {
-        PathBuf::from(r).join("ps")
-    } else {
-        state.python_dir.join("../ps")
-    };
-    let bridge = ps_dir.join("trae-switch-bridge.ps1");
-    if !bridge.exists() {
-        return Err(format!("找不到切换脚本: {}", bridge.display()));
-    }
-
     fs_utils::app_log(&state.data_dir, &format!("开始恢复登录态: user_id={user_id}"));
 
-    let mut child = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &bridge.to_string_lossy(),
-            "-Action",
-            "RestoreOnly",
-            "-UserId",
-            &user_id,
-            "-Json",
-        ])
-        .creation_flags(0x08000000)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("启动恢复失败: {e}"))?;
-
-    let stdout = child.stdout.take().ok_or("恢复脚本无输出")?;
-    let stderr = child.stderr.take();
-    let app2 = app.clone();
-    let data_dir = state.data_dir.clone();
-
-    std::thread::spawn(move || {
-        let reader = std::io::BufReader::new(stdout);
-        let mut done_emitted = false;
-        for line in std::io::BufRead::lines(reader) {
-            if let Ok(l) = line {
-                let l = l.trim().to_string();
-                if l.is_empty() {
-                    continue;
-                }
-                let _ = app2.emit("profile-progress", &l);
-                if l.contains("\"stage\":\"done\"") || l.contains("\"stage\":\"fatal\"") {
-                    let success = l.contains("\"stage\":\"done\"");
-                    done_emitted = true;
-                    let _ = app2.emit(
-                        "profile-done",
-                        serde_json::json!({ "success": success, "raw": l, "action": "restore" }),
-                    );
-                }
-            }
-        }
-        let exit_status = child.wait();
-        if !done_emitted {
-            let success = matches!(&exit_status, Ok(s) if s.success());
-            let _ = app2.emit(
-                "profile-done",
-                serde_json::json!({ "success": success, "raw": format!("exit: {:?}", exit_status), "action": "restore" }),
-            );
-        }
-    });
-
-    if let Some(stderr) = stderr {
-        std::thread::spawn(move || {
-            let log_path = data_dir.join("logs").join("switcher.log");
-            let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
-            let reader = std::io::BufReader::new(stderr);
-            for line in std::io::BufRead::lines(reader) {
-                if let Ok(l) = line {
-                    let l = format!("[stderr] {}", l.trim());
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&log_path)
-                    {
-                        let _ = std::writeln!(f, "[{}] {}", fs_utils::now_ts(), l);
-                    }
-                }
-            }
-        });
-    }
-
-    Ok(())
+    crate::commands::bridge::run_bridge_async(
+        &app,
+        &state.data_dir,
+        "RestoreOnly",
+        Some(&user_id),
+        "profile-progress",
+        "profile-done",
+        Some(serde_json::json!({ "action": "restore" })),
+    )
 }
 
 /// 删除指定 slot 的登录态快照

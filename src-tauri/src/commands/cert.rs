@@ -1,3 +1,4 @@
+#[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 use tauri::{AppHandle, State};
@@ -12,16 +13,33 @@ pub struct CertStatus {
 
 #[tauri::command(async)]
 pub fn cert_status(_app: AppHandle, _state: State<AppState>) -> CertStatus {
-    let out = Command::new("certutil")
-        .args(["-store", "Root"])
-        .creation_flags(0x08000000)
-        .output();
-    let installed = match out {
-        Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.contains("TraeDeviceProxyCA")
+    #[cfg(target_os = "windows")]
+    let installed = {
+        let out = Command::new("certutil")
+            .args(["-store", "Root"])
+            .creation_flags(0x08000000)
+            .output();
+        match out {
+            Ok(o) => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                s.contains("TraeDeviceProxyCA")
+            }
+            Err(_) => false,
         }
-        Err(_) => false,
+    };
+    #[cfg(not(target_os = "windows"))]
+    let installed = {
+        // macOS：在钥匙串中查找自签 CA（含登录钥匙串与系统钥匙串）
+        let out = Command::new("security")
+            .args(["find-certificate", "-a", "-c", "TraeDeviceProxyCA"])
+            .output();
+        match out {
+            Ok(o) => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                s.contains("TraeDeviceProxyCA")
+            }
+            Err(_) => false,
+        }
     };
     CertStatus { installed }
 }
@@ -29,10 +47,11 @@ pub fn cert_status(_app: AppHandle, _state: State<AppState>) -> CertStatus {
 /// 检查当前解析到的 Python 环境能否导入指定模块。
 /// dev 环境回退系统 Python 时，cryptography 缺失是 --gen-ca 失败的头号原因。
 fn python_import_ok(state: &AppState, module: &str) -> bool {
-    Command::new(&state.python_exe)
-        .args(["-c", &format!("import {module}")])
-        .creation_flags(0x08000000)
-        .output()
+    let mut cmd = Command::new(&state.python_exe);
+    cmd.args(["-c", &format!("import {module}")]);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+    cmd.output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -57,10 +76,25 @@ fn is_embedded_runtime(state: &AppState) -> bool {
 
 /// 用当前 Python 环境安装依赖包（cryptography 缺失时自愈，吸收 main a3301c7）。
 fn pip_install(state: &AppState, pkgs: &[&str]) -> Result<(), String> {
-    let out = Command::new(&state.python_exe)
-        .args(["-m", "pip", "install", "--disable-pip-version-check", "--no-input"])
-        .args(pkgs)
-        .creation_flags(0x08000000)
+    let mut cmd = Command::new(&state.python_exe);
+    cmd.args(["-m", "pip", "install", "--disable-pip-version-check", "--no-input"])
+        .args(pkgs);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+    let out = cmd
+        .output()
+        .map_err(|e| format!("启动 pip 失败: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    // 新版 Homebrew/系统 Python 启用 PEP 668（externally-managed）时需 --break-system-packages
+    let mut retry = Command::new(&state.python_exe);
+    retry
+        .args(["-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--break-system-packages"])
+        .args(pkgs);
+    #[cfg(target_os = "windows")]
+    retry.creation_flags(0x08000000);
+    let out = retry
         .output()
         .map_err(|e| format!("启动 pip 失败: {e}"))?;
     if out.status.success() {
@@ -93,7 +127,12 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
     // 0. 依赖自检（吸收 main a3301c7）：dev 环境回退系统 Python 时 cryptography
     //    缺失是 --gen-ca 失败的头号原因，先自愈再继续；已内置运行时则秒过。
     if !python_import_ok(&state, "cryptography") {
-        pip_install(&state, &["cryptography>=42.0.0", "pywin32>=306"]).map_err(|e| {
+        let pkgs: &[&str] = if cfg!(target_os = "windows") {
+            &["cryptography>=42.0.0", "pywin32>=306"]
+        } else {
+            &["cryptography>=42.0.0"]
+        };
+        pip_install(&state, pkgs).map_err(|e| {
             // 内嵌 embeddable 运行时不含 pip（构建期已装齐依赖）：依赖缺失说明
             // 安装目录被损坏（如杀软误删），提示重装而非引导手动 pip（无 pip 可用）
             if is_embedded_runtime(&state) {
@@ -103,7 +142,7 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
                 )
             } else {
                 format!(
-                    "Python 缺少 cryptography 模块且自动安装失败（{}）。请手动执行：\"{}\" -m pip install cryptography pywin32",
+                    "Python 缺少 cryptography 模块且自动安装失败（{}）。请手动执行：\"{}\" -m pip install cryptography",
                     e, state.python_exe
                 )
             }
@@ -139,7 +178,7 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
                     "。提示：内置运行时已随安装包自带全部依赖，报缺模块说明安装目录被损坏（如杀软误删），请重新安装本应用恢复。".to_string()
                 } else {
                     format!(
-                        "。提示：Python 依赖缺失，请在 \"{}\" 中执行 -m pip install cryptography pywin32 后重试（解释器路径可查 app.log 的 python_exe= 行）",
+                        "。提示：Python 依赖缺失，请在 \"{}\" 中执行 -m pip install cryptography 后重试（解释器路径可查 app.log 的 python_exe= 行）",
                         state.python_exe
                     )
                 }
@@ -152,34 +191,68 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
     if !cer.exists() {
         return Err("CA 证书生成失败，无法安装".into());
     }
+    #[cfg(target_os = "windows")]
     let cer_arg = cer.to_string_lossy().replace('\\', "/").to_string();
+    #[cfg(not(target_os = "windows"))]
+    let cer_arg = cer.to_string_lossy().to_string();
 
-    // 2. 以管理员权限安装到本地计算机受信任根证书颁发机构（触发 UAC）。
-    //    -PassThru 拿到 certutil 进程对象并用其 ExitCode 退出 powershell，
-    //    保证 status.success() 反映 certutil 的真实结果（而非仅 powershell 自身）；
-    //    路径内嵌双引号，含空格的目录（如 C:\Users\John Doe\...）不会被拆成多个参数。
-    let ps = format!(
-        "$p = Start-Process certutil -ArgumentList @('-addstore','-f','Root','\"{}\"') -Verb RunAs -Wait -PassThru; exit $p.ExitCode",
-        cer_arg
-    );
-    let status = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &ps])
-        .creation_flags(0x08000000)
-        .status()
-        .map_err(|e| format!("启动证书安装失败: {e}"))?;
-
-    if !status.success() {
-        return Err(format!(
-            "证书安装失败或被取消（certutil 退出码 {:?}；可能需要管理员权限或被组策略拒绝）",
-            status.code()
-        ));
+    // 2. 安装到系统受信任根证书：
+    //    Windows：certutil -addstore Root（触发 UAC，-PassThru 拿真实退出码）；
+    //    macOS：security add-trusted-cert 加入登录钥匙串信任设置（可能弹系统授权框）。
+    #[cfg(target_os = "windows")]
+    {
+        let ps = format!(
+            "$p = Start-Process certutil -ArgumentList @('-addstore','-f','Root','\"{}\"') -Verb RunAs -Wait -PassThru; exit $p.ExitCode",
+            cer_arg
+        );
+        let status = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &ps])
+            .creation_flags(0x08000000)
+            .status()
+            .map_err(|e| format!("启动证书安装失败: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "证书安装失败或被取消（certutil 退出码 {:?}；可能需要管理员权限或被组策略拒绝）",
+                status.code()
+            ));
+        }
     }
-    // 3. 安装后复查根存储（吸收 main a3301c7）：certutil 报成功但证书未实际
+    #[cfg(target_os = "macos")]
+    {
+        let keychain = format!(
+            "{}/Library/Keychains/login.keychain-db",
+            std::env::var("HOME").unwrap_or_default()
+        );
+        let status = Command::new("security")
+            .args([
+                "add-trusted-cert",
+                "-r",
+                "trustRoot",
+                "-p",
+                "ssl",
+                "-k",
+                &keychain,
+                &cer_arg,
+            ])
+            .status()
+            .map_err(|e| format!("启动证书安装失败: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "证书安装失败或被取消（security 退出码 {:?}；若系统弹窗请点「允许」后重试）",
+                status.code()
+            ));
+        }
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        return Err("当前平台不支持证书安装".into());
+    }
+    // 3. 安装后复查根存储（吸收 main a3301c7）：安装命令报成功但证书未实际
     //    入库（组策略拦截/存储重定向）时不能误报「安装成功」。
     let result = cert_status(app, state);
     if !result.installed {
         return Err(
-            "证书安装命令已执行，但根证书存储中未找到 TraeDeviceProxyCA，请检查系统策略".into(),
+            "证书安装命令已执行，但证书存储中未找到 TraeDeviceProxyCA，请检查系统策略".into(),
         );
     }
     Ok(result)

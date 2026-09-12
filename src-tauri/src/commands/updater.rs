@@ -371,7 +371,24 @@ fn fetch_manifest_hash(
 /// 仓库中 v3.x.x 是另一产品线，直接忽略（不能用 releases/latest，会被 3.x 遮蔽）。
 /// async 派发：网络重试最坏 90s（3 通道 × 30s），同步命令默认跑主线程会冻住 UI。
 #[tauri::command(async)]
+#[allow(unreachable_code)] // 非 Windows 在函数开头早退，后续 NSIS 逻辑不可达
 pub fn update_check() -> Result<UpdateCheckResult, String> {
+    // macOS：自动更新链路（下载校验 + NSIS /P 被动安装）为 Windows 专属，
+    // 直接返回无更新；如需升级请到发布页手动下载 dmg。
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Ok(UpdateCheckResult {
+            has_update: false,
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            latest_version: env!("CARGO_PKG_VERSION").to_string(),
+            asset_name: String::new(),
+            download_url: String::new(),
+            size: 0,
+            sha256: String::new(),
+            release_page: RELEASES_PAGE.to_string(),
+        });
+    }
+
     let current = parse_version(env!("CARGO_PKG_VERSION")).ok_or("内置版本号解析失败")?;
     let releases = fetch_releases()?;
 

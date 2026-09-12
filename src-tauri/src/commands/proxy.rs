@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader};
+#[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -19,6 +20,24 @@ static PROXY_INTENTIONAL_STOP: AtomicBool = AtomicBool::new(false);
 /// 停止时再还原回去，避免覆盖/丢失用户原有的 VPN 代理设置。
 /// 存储 (enabled, server, override)。
 static PREV_SYSTEM_PROXY: Mutex<Option<(bool, String, String)>> = Mutex::new(None);
+
+/// macOS：启动代理前各网络服务的完整代理状态（web/secure/bypass），停止时精确还原。
+#[cfg(target_os = "macos")]
+static PREV_MAC_PROXY_STATES: Mutex<Option<Vec<MacProxyState>>> = Mutex::new(None);
+
+/// macOS：单个网络服务的代理状态快照
+#[cfg(target_os = "macos")]
+struct MacProxyState {
+    service: String,
+    web_enabled: bool,
+    web_server: String,
+    web_port: String,
+    secure_enabled: bool,
+    secure_server: String,
+    secure_port: String,
+    /// 当前 Proxy bypass domains（还原时需一并写回，避免丢失用户的例外列表）
+    bypass: Vec<String>,
+}
 
 pub struct ProxyHandle {
     pub child: Child,
@@ -98,7 +117,34 @@ fn kill_stale_proxy_processes(script_path: &std::path::Path) -> Vec<u32> {
     killed
 }
 
-#[cfg(not(target_os = "windows"))]
+/// macOS：按脚本完整路径匹配并清理孤儿代理进程（pgrep -f 精确匹配命令行）
+#[cfg(target_os = "macos")]
+fn kill_stale_proxy_processes(script_path: &std::path::Path) -> Vec<u32> {
+    let me = script_path.to_string_lossy().to_string();
+    let Ok(out) = Command::new("pgrep")
+        .arg("-f")
+        .arg(&me)
+        .output()
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut killed = Vec::new();
+    for pid in text.split_whitespace().filter_map(|p| p.parse::<u32>().ok()) {
+        if Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            killed.push(pid);
+        }
+    }
+    killed
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn kill_stale_proxy_processes(_script_path: &std::path::Path) -> Vec<u32> {
     Vec::new()
 }
@@ -135,6 +181,24 @@ pub fn proxy_start(
     let script_path = state.python_dir.join("device_proxy.py");
     if !script_path.exists() {
         return Err(format!("找不到脚本: {}", script_path.display()));
+    }
+    // macOS：无内嵌 Python 运行时，检查系统 python3 的 cryptography 依赖
+    //（device_proxy.py 生成自签 CA 必需），缺失时给出安装指引。
+    #[cfg(target_os = "macos")]
+    {
+        let ok = Command::new(&state.python_exe)
+            .args(["-c", "import cryptography"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            return Err(
+                "Python 缺少 cryptography 依赖（生成自签证书必需）。\
+                 请在终端执行: python3 -m pip install --user cryptography \
+                 （若报权限错误可追加 --break-system-packages）后重试"
+                    .into(),
+            );
+        }
     }
     // ── 端口占用预检 + 孤儿自愈（Issue #7）─────────────────────────────
     // spawn 前用一次性 TcpListener 试绑目标端口：已被占用（如上次泄漏的孤儿
@@ -203,7 +267,35 @@ pub fn proxy_start(
                 }
             }
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        {
+            // 捕获所有网络服务的代理快照（含 bypass），停止时精确还原；
+            // 同时检测外部 VPN 代理作为上游透传（格式 "host:port"，与 Windows 一致）。
+            let services = list_network_services();
+            let mut states = Vec::new();
+            let mut upstream: Option<String> = None;
+            for svc in &services {
+                if let Some(st) = get_mac_proxy_state(svc) {
+                    if upstream.is_none()
+                        && st.web_enabled
+                        && !st.web_server.is_empty()
+                        && st.web_server != "127.0.0.1"
+                    {
+                        upstream = Some(format!("{}:{}", st.web_server, st.web_port));
+                    }
+                    states.push(st);
+                }
+            }
+            *safe_lock(&PREV_MAC_PROXY_STATES) = Some(states);
+            // 上游若是本机同端口（上次未清理的自身代理残留），不作为上游
+            if let Some(up) = &upstream {
+                if up == proxy_addr {
+                    upstream = None;
+                }
+            }
+            upstream
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             None
         }
@@ -211,13 +303,15 @@ pub fn proxy_start(
 
     let mut cmd = Command::new(&state.python_exe);
     cmd.arg(&script_path)
-        .creation_flags(0x08000000)
         .env("TRAEDATA_DIR", &data_dir)
         .env("PROXY_PORT", &port_s)
         .env("AUTO_CAPTURE_JWT", "1")
         .env("PROXY_DOMAINS", &proxy_domains)
         .env("PROXY_LOG_PATH", &proxy_log_path)
         .env("PYTHONIOENCODING", "utf-8");
+    // Windows：隐藏子进程控制台窗口
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
     if let Some(up) = &upstream_proxy {
         cmd.env("UPSTREAM_PROXY", up);
     }
@@ -237,6 +331,10 @@ pub fn proxy_start(
     if let Some(status) = wait_exit_quick(&mut child) {
         // 丢弃已捕获的「启动前系统代理」记录：尚未设置系统代理，无需还原
         *PREV_SYSTEM_PROXY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        #[cfg(target_os = "macos")]
+        {
+            *safe_lock(&PREV_MAC_PROXY_STATES) = None;
+        }
         return Err(format!(
             "代理进程启动后立即退出（退出码 {:?}）。\
              常见原因：端口 127.0.0.1:{port} 被占用；具体报错见代理日志面板（stderr 行）。",
@@ -316,7 +414,7 @@ pub fn proxy_start(
                 "[严重] 代理进程异常退出，正在还原系统代理以避免全局断网…",
             );
             fs_utils::app_log(std::path::Path::new(&data_dir2), "代理进程异常退出，自动还原系统代理");
-            if let Err(e) = clear_win_proxy() {
+            if let Err(e) = restore_system_proxy() {
                 fs_utils::app_log(std::path::Path::new(&data_dir2), &format!("还原系统代理失败: {e}"));
             }
             let _ = app_for_thread.emit("proxy-crashed", "");
@@ -340,8 +438,8 @@ pub fn proxy_start(
         });
     }
 
-    // 同步把 Windows 系统代理指向本机端口，使 TRAE 鉴权请求(api.trae.cn)汇入本代理
-    match set_win_proxy(&proxy_addr) {
+    // 同步把系统代理指向本机端口，使 TRAE 鉴权请求(api.trae.cn)汇入本代理
+    match set_system_proxy(&proxy_addr) {
         Ok(()) => {
             let _ = app.emit(
                 "proxy-log",
@@ -381,31 +479,11 @@ pub fn proxy_stop(
         // h 在此处 drop，Drop trait 会 kill + wait 子进程
     }
     // 还原系统代理：若启动前存在外部代理(VPN)，则还原之；否则清空，避免本机全局断网
-    #[cfg(target_os = "windows")]
-    {
-        let prev = PREV_SYSTEM_PROXY
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        let res = match prev {
-            Some((en, sv, ov)) if en => apply_proxy(true, &sv, &ov),
-            _ => clear_win_proxy(),
-        };
-        if let Err(e) = res {
-            fs_utils::app_log(
-                &state.data_dir,
-                &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
-            );
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        if let Err(e) = clear_win_proxy() {
-            fs_utils::app_log(
-                &state.data_dir,
-                &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
-            );
-        }
+    if let Err(e) = restore_system_proxy() {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
+        );
     }
     Ok(ProxyStatus {
         running: false,
@@ -606,12 +684,228 @@ fn run_reg(key: &str, name: &str, kind: &str, value: &str) -> Result<(), String>
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
-fn set_win_proxy(_addr: &str) -> Result<(), String> {
-    Err("仅 Windows 支持系统代理设置".into())
+// ---------------- macOS 系统代理设置（networksetup） ----------------
+// macOS 通过 networksetup 命令管理各网络服务（Wi-Fi/Ethernet/…）的代理。
+// Electron（TRAE）默认跟随系统代理，故把每个网络服务的 web/secure 代理指向
+// 本机端口即可拦截 TRAE 鉴权流量；停止时按启动前快照精确还原。
+
+/// 执行 networksetup 并返回 stdout；失败返回 Err（含 stderr 信息）
+#[cfg(target_os = "macos")]
+fn run_networksetup(args: &[&str]) -> Result<String, String> {
+    let out = Command::new("networksetup")
+        .args(args)
+        .output()
+        .map_err(|e| format!("执行 networksetup 失败: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "networksetup {} 失败: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-#[cfg(not(target_os = "windows"))]
-fn clear_win_proxy() -> Result<(), String> {
-    Err("仅 Windows 支持系统代理设置".into())
+/// 列出所有网络服务（跳过标题行；带 * 前缀的已禁用服务跳过，对其设置无意义）
+#[cfg(target_os = "macos")]
+fn list_network_services() -> Vec<String> {
+    match run_networksetup(&["-listallnetworkservices"]) {
+        Ok(out) => out
+            .lines()
+            .skip(1)
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('*'))
+            .map(|s| s.to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 解析 `-getwebproxy` / `-getsecurewebproxy` 输出 → (enabled, server, port)
+#[cfg(target_os = "macos")]
+fn parse_proxy_output(out: &str) -> (bool, String, String) {
+    let mut enabled = false;
+    let mut server = String::new();
+    let mut port = String::new();
+    for line in out.lines() {
+        let l = line.trim();
+        if let Some(v) = l.strip_prefix("Enabled:") {
+            enabled = v.trim().eq_ignore_ascii_case("yes");
+        } else if let Some(v) = l.strip_prefix("Server:") {
+            server = v.trim().to_string();
+        } else if let Some(v) = l.strip_prefix("Port:") {
+            port = v.trim().to_string();
+        }
+    }
+    (enabled, server, port)
+}
+
+/// 读取单个网络服务的完整代理状态快照
+#[cfg(target_os = "macos")]
+fn get_mac_proxy_state(service: &str) -> Option<MacProxyState> {
+    let web = run_networksetup(&["-getwebproxy", service]).ok()?;
+    let secure = run_networksetup(&["-getsecurewebproxy", service]).ok()?;
+    let bypass = run_networksetup(&["-getproxybypassdomains", service])
+        .map(|out| {
+            out.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let (we, ws, wp) = parse_proxy_output(&web);
+    let (se, ss, sp) = parse_proxy_output(&secure);
+    // "Enabled: No" 时 server/port 仍会输出占位值，无需清空——还原时按 enabled 开关即可
+    Some(MacProxyState {
+        service: service.to_string(),
+        web_enabled: we,
+        web_server: ws,
+        web_port: wp,
+        secure_enabled: se,
+        secure_server: ss,
+        secure_port: sp,
+        bypass,
+    })
+}
+
+/// 把所有网络服务的 web/secure 代理指向 addr（"host:port"），并设置本机地址直连绕过。
+/// 单个服务设置失败（如未启用的网卡）只记录不中断，避免整机代理失败。
+#[cfg(target_os = "macos")]
+fn set_mac_proxy_all(addr: &str) -> Result<(), String> {
+    let (server, port) = addr
+        .rsplit_once(':')
+        .ok_or_else(|| format!("代理地址格式错误: {addr}"))?;
+    let services = list_network_services();
+    if services.is_empty() {
+        return Err("未找到任何网络服务（networksetup -listallnetworkservices 失败）".into());
+    }
+    let mut failures = Vec::new();
+    for svc in &services {
+        if let Err(e) = run_networksetup(&[
+            "-setwebproxy",
+            svc,
+            server,
+            port,
+        ]) {
+            failures.push(e);
+        }
+        if let Err(e) = run_networksetup(&[
+            "-setsecurewebproxy",
+            svc,
+            server,
+            port,
+        ]) {
+            failures.push(e);
+        }
+        // localhost 绕过：保证本机 127.0.0.1:7864（API 服务）不经过代理
+        let _ = run_networksetup(&[
+            "-setproxybypassdomains",
+            svc,
+            "127.0.0.1",
+            "localhost",
+            "*.local",
+            "169.254/16",
+        ]);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("部分网络服务代理设置失败: {}", failures.join("; ")))
+    }
+}
+
+/// 按启动前快照还原各网络服务代理；无快照（如异常状态）则全部关闭代理。
+#[cfg(target_os = "macos")]
+fn restore_mac_proxy_states() -> Result<(), String> {
+    let prev = safe_lock(&PREV_MAC_PROXY_STATES).take();
+    match prev {
+        Some(states) => {
+            for st in &states {
+                if st.web_enabled {
+                    let _ = run_networksetup(&[
+                        "-setwebproxy",
+                        &st.service,
+                        &st.web_server,
+                        &st.web_port,
+                    ]);
+                } else {
+                    let _ = run_networksetup(&["-setwebproxystate", &st.service, "off"]);
+                }
+                if st.secure_enabled {
+                    let _ = run_networksetup(&[
+                        "-setsecurewebproxy",
+                        &st.service,
+                        &st.secure_server,
+                        &st.secure_port,
+                    ]);
+                } else {
+                    let _ = run_networksetup(&["-setsecurewebproxystate", &st.service, "off"]);
+                }
+                // 还原 bypass 域名列表（空列表 = 清空，用空字符串占位）
+                let mut args: Vec<String> = vec![
+                    "-setproxybypassdomains".into(),
+                    st.service.clone(),
+                ];
+                if st.bypass.is_empty() {
+                    args.push(String::new());
+                } else {
+                    args.extend(st.bypass.iter().cloned());
+                }
+                let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                let _ = run_networksetup(&arg_refs);
+            }
+            Ok(())
+        }
+        None => {
+            // 无快照：保守做法，关闭所有服务的 web/secure 代理
+            for svc in list_network_services() {
+                let _ = run_networksetup(&["-setwebproxystate", &svc, "off"]);
+                let _ = run_networksetup(&["-setsecurewebproxystate", &svc, "off"]);
+            }
+            Ok(())
+        }
+    }
+}
+
+// ---------------- 跨平台统一入口 ----------------
+
+/// 设置系统代理指向本机代理端口（Windows: 注册表；macOS: networksetup）
+fn set_system_proxy(addr: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        set_win_proxy(addr)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        set_mac_proxy_all(addr)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = addr;
+        Err("当前平台不支持系统代理设置".into())
+    }
+}
+
+/// 还原系统代理到启动前状态（有外部 VPN 则还原之，否则关闭），避免全局断网
+pub(crate) fn restore_system_proxy() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let prev = PREV_SYSTEM_PROXY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        match prev {
+            Some((en, sv, ov)) if en => apply_proxy(true, &sv, &ov),
+            _ => clear_win_proxy(),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        restore_mac_proxy_states()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        Err("当前平台不支持系统代理设置".into())
+    }
 }

@@ -24,21 +24,24 @@ use tauri::State;
 use crate::fs_utils;
 use crate::state::AppState;
 
-const STORAGE_SUFFIX: &str = r"User\globalStorage\storage.json";
+/// storage.json 相对路径（跨平台用 PathBuf::join 拼接）
+fn storage_json_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("User").join("globalStorage").join("storage.json")
+}
 
 /// Trae Work 应用数据目录候选（按优先级）
 fn app_data_dirs() -> Vec<std::path::PathBuf> {
-    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let root = crate::state::app_data_root().unwrap_or_default();
     vec![
-        std::path::PathBuf::from(&appdata).join("TRAE SOLO CN"),
-        std::path::PathBuf::from(&appdata).join("TRAE SOLO"),
+        root.join("TRAE SOLO CN"),
+        root.join("TRAE SOLO"),
     ]
 }
 
 /// 读取 Trae Work 的 storage.json（多个候选目录取第一个存在的）
 fn read_storage_json() -> Option<serde_json::Value> {
     for dir in app_data_dirs() {
-        let p = dir.join(STORAGE_SUFFIX);
+        let p = storage_json_path(&dir);
         if p.is_file() {
             if let Ok(s) = std::fs::read_to_string(&p) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
@@ -154,7 +157,10 @@ fn current_uid_from_logs(dir: &std::path::Path) -> Option<String> {
 /// `<uid>:remote-welcome-toast-shown`、`solo-lite-mode-state-map-<uid>`。
 /// 零 SQLite 依赖，直接字节扫描（键名在文件中为明文 ASCII）。
 fn historical_uids_from_vscdb(dir: &std::path::Path) -> Vec<String> {
-    let p = dir.join(r"User\globalStorage\state.vscdb");
+    let p = dir
+        .join("User")
+        .join("globalStorage")
+        .join("state.vscdb");
     let Ok(bytes) = std::fs::read(&p) else {
         return Vec::new();
     };
@@ -285,7 +291,7 @@ pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> 
         if !dir.is_dir() {
             continue;
         }
-        let storage_path = dir.join(STORAGE_SUFFIX);
+        let storage_path = storage_json_path(&dir);
         let path_display = if storage_path.is_file() {
             storage_path.to_string_lossy().to_string()
         } else {

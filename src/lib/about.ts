@@ -8,7 +8,7 @@ export const APP_NAME = 'Trae Work Assistant';
 export const APP_VERSION = pkg.version;
 export const APP_TAGLINE = 'Trae Work 多账号管理与增强工具';
 export const APP_OVERVIEW =
-  '面向 Trae Work（TRAE SOLO CN）的 Windows 桌面端多账号管理工具，' +
+  '面向 Trae Work（TRAE SOLO CN）的桌面端多账号管理工具，' +
   '基于 Tauri 2 + React 18 + Rust。' +
   '支持 Trae Work 多账号管理、登录态切换、一键签到、积分看板、本地 MITM 代理自动捕获 JWT、' +
   '设备标识重置与 OpenAI 兼容 API 网关，数据全部本地存储。';

@@ -1,5 +1,6 @@
 //! Python 子进程管理辅助。
 use std::path::PathBuf;
+#[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
@@ -57,9 +58,10 @@ pub fn spawn_script(
     let mut cmd = Command::new(&state.python_exe);
     cmd.arg(&script_path)
         .args(args)
-        .creation_flags(0x08000000)
         .env("TRAEDATA_DIR", &data_dir)
         .env("PYTHONIOENCODING", "utf-8");
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
     if capture {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     }

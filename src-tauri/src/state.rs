@@ -1,5 +1,6 @@
-﻿//! 应用全局状态与目录布局（conf/data/logs 子目录路由、python/ps 资源定位）。
+//! 应用全局状态与目录布局（conf/data/logs 子目录路由、python/ps 资源定位）。
 use std::path::PathBuf;
+#[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::sync::Mutex;
@@ -21,13 +22,36 @@ pub struct AppState {
 /// 配置文件名列表（路由到 conf/ 目录）
 const CONF_FILES: &[&str] = &["app_settings.json"];
 
+/// 平台数据根目录：Windows 为 %APPDATA%，macOS 为 ~/Library/Application Support。
+pub(crate) fn app_data_root() -> Result<PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .map_err(|_| "无法读取 APPDATA 环境变量".to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").map_err(|_| "无法读取 HOME 环境变量".to_string())?;
+        Ok(PathBuf::from(home).join("Library").join("Application Support"))
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        std::env::var("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| PathBuf::from(h).join(".local").join("share"))
+            })
+            .map_err(|_| "无法确定应用数据目录".to_string())
+    }
+}
+
 impl AppState {
     pub fn new() -> Result<Self, String> {
-        // 数据目录：%APPDATA%\TraeWorkAssistant，不存在则创建
-        let appdata = std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .map_err(|_| "无法读取 APPDATA 环境变量".to_string())?;
-        let data_dir = appdata.join("TraeWorkAssistant");
+        // 数据目录：Windows %APPDATA%\TraeWorkAssistant；
+        // macOS ~/Library/Application Support/TraeWorkAssistant
+        let data_dir = app_data_root()?.join("TraeWorkAssistant");
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("创建数据目录失败: {e}"))?;
 
@@ -42,9 +66,10 @@ impl AppState {
         // python 脚本目录：优先取 Tauri 资源目录下的 python/，否则回退到源码目录
         let python_dir = resolve_python_dir();
 
-        // python 解释器：资源目录内嵌的 python.exe 优先；否则探测系统可用解释器。
-        // Windows 官方安装通常提供 python.exe / py.exe，python3 反而常不存在，故依次探测。
-        let embedded = python_dir.join("python.exe");
+        // python 解释器：资源目录内嵌的 python.exe 优先（Windows 安装包内嵌运行时）；
+        // 否则探测系统可用解释器。Windows 官方安装通常提供 python.exe / py.exe，
+        // python3 反而常不存在；macOS/Linux 则优先 python3。
+        let embedded = python_dir.join(if cfg!(target_os = "windows") { "python.exe" } else { "python3" });
         let python_exe = if embedded.exists() {
             embedded.to_string_lossy().to_string()
         } else {
@@ -206,17 +231,21 @@ pub fn resolve_ps_dir() -> PathBuf {
     PathBuf::from("src-ps")
 }
 
-/// 探测系统可用的 Python 解释器，依次尝试 python / python3 / py。
+/// 探测系统可用的 Python 解释器。Windows 依次尝试 python / python3 / py；
+/// macOS/Linux 依次尝试 python3 / python。
 /// 均不可用时兜底返回 "python3"（保持原行为，由上层在启动时报错提示）。
 fn probe_python_exe() -> String {
-    for cand in ["python", "python3", "py"] {
-        if Command::new(cand)
-            .arg("--version")
-            .creation_flags(0x08000000)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
+    let candidates: &[&str] = if cfg!(target_os = "windows") {
+        &["python", "python3", "py"]
+    } else {
+        &["python3", "python"]
+    };
+    for cand in candidates {
+        let mut cmd = Command::new(cand);
+        cmd.arg("--version");
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(0x08000000);
+        if cmd.output().map(|o| o.status.success()).unwrap_or(false) {
             return cand.to_string();
         }
     }

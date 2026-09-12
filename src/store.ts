@@ -1,4 +1,4 @@
-﻿import { create } from 'zustand';
+import { create } from 'zustand';
 import { sendNotification } from '@tauri-apps/plugin-notification';
 import { api, setupListeners, type CheckinProgressEvent, type ProfileDoneEvent, type SaveLoginDoneEvent } from './lib/tauri';
 import type {
@@ -257,12 +257,12 @@ export const useAppStore = create<AppState>((set, get) => ({
           deviceResetActive: false,
           deviceResetProgress: [
             ...s.deviceResetProgress.slice(-99),
-            e.success ? '[完成] 6 层设备标识重置成功' : '[失败] 设备标识重置未完成，请查看日志',
+            e.success ? '[完成] 设备标识重置成功' : '[失败] 设备标识重置未完成，请查看日志',
           ],
         }));
         get().pushToast(
           e.success ? 'success' : 'error',
-          e.success ? '6 层设备标识重置完成' : '设备标识重置失败，请查看日志',
+          e.success ? '设备标识重置完成' : '设备标识重置失败，请查看日志',
         );
       },
       onProfileProgress: (line) =>

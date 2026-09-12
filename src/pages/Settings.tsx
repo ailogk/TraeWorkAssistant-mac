@@ -8,6 +8,9 @@ import { withMinDelay } from '../lib/delay';
 import { THEMES } from '../lib/themes';
 import type { Settings as SettingsType } from '../types';
 
+/** 运行平台检测：文案按平台展示（macOS 用 .app 路径 / launchd；Windows 用 .exe / 计划任务） */
+const IS_MAC = typeof navigator !== 'undefined' && /Mac/i.test(navigator.userAgent);
+
 /**
  * 系统设置：通用配置 / 设备标识重置（左列），签到行为 / 每日定时签到 / 代理配置（右列）。
  * 关于信息已移至左下角「软件说明」弹框。
@@ -291,7 +294,7 @@ export default function Settings() {
                   type="text"
                   value={form.trae_path ?? ''}
                   onChange={(e) => update('trae_path', e.target.value.trim() || null)}
-                  placeholder="默认 C:\Users\你\AppData\Local\Programs\TRAE SOLO CN\TRAE SOLO CN.exe"
+                  placeholder={IS_MAC ? '默认 /Applications/TRAE SOLO CN.app' : '默认 C:\\Users\\你\\AppData\\Local\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe'}
                   className="input flex-1"
                 />
                 <button onClick={detectTrae} disabled={detecting} className="btn-outline shrink-0">
@@ -299,7 +302,9 @@ export default function Settings() {
                 </button>
               </div>
               <p className="mt-1 text-xs text-slate-400">
-                TRAE SOLO CN 的 exe 路径，自定义安装目录时需填写。
+                {IS_MAC
+                  ? 'TRAE SOLO CN 的应用路径（.app），自定义安装目录时需填写。'
+                  : 'TRAE SOLO CN 的 exe 路径，自定义安装目录时需填写。'}
               </p>
             </div>
             <div>
@@ -319,8 +324,9 @@ export default function Settings() {
         <section className="card p-4">
           <h3 className="mb-1 font-medium">设备标识重置</h3>
           <p className="mb-3 text-xs text-slate-500">
-            一次性重置 Trae Work 的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④
-            TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭 Trae Work。
+            {IS_MAC
+              ? '一次性重置 Trae Work 的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④ TinyStorage ⑤ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭 Trae Work。'
+              : '一次性重置 Trae Work 的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④ TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭 Trae Work。'}
           </p>
           <div className="flex items-center gap-2">
             <button
@@ -382,7 +388,9 @@ export default function Settings() {
         <section className="card p-4">
           <h3 className="mb-1 font-medium">每日定时签到</h3>
           <p className="mb-3 text-xs text-slate-400">
-            通过 Windows 计划任务在指定时间自动运行签到脚本，无需启动应用界面。注册/删除需要管理员权限。
+            {IS_MAC
+              ? '通过 macOS launchd 在指定时间自动运行签到脚本，无需启动应用界面。'
+              : '通过 Windows 计划任务在指定时间自动运行签到脚本，无需启动应用界面。注册/删除需要管理员权限。'}
           </p>
           <div className="flex flex-wrap items-center gap-2">
             <div className="relative flex items-center">
@@ -526,8 +534,8 @@ export default function Settings() {
               <li>② storage.json telemetry</li>
               <li>③ storage.json aha.device</li>
               <li>④ TinyStorage</li>
-              <li>⑤ 注册表 MachineGuid</li>
-              <li>⑥ webview 追踪数据</li>
+              {!IS_MAC && <li>⑤ 注册表 MachineGuid</li>}
+              <li>{IS_MAC ? '⑤' : '⑥'} webview 追踪数据</li>
             </ul>
             <p className="mt-2 text-xs text-amber-500">建议先关闭 TRAE 再执行。</p>
           </div>

@@ -1,3 +1,4 @@
+#[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 
@@ -496,7 +497,9 @@ pub fn read_text_file(path: String) -> Result<String, String> {
 }
 
 // ---------------- 定时任务 ----------------
+// Windows：schtasks 计划任务；macOS：launchd LaunchAgent（~/Library/LaunchAgents）
 
+#[cfg(target_os = "windows")]
 // 运行 schtasks 并正确解码输出。
 // 关键：默认控制台代码页是 GBK（中文 Windows），schtasks 的中文报错(如"系统找不到指定的文件")
 // 以 GBK 字节输出；若直接 from_utf8_lossy 会读成 ϵͳ... 乱码，导致 "找不到" 永远匹配不上、
@@ -524,6 +527,7 @@ fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
     Ok((out.status.success(), stdout, stderr))
 }
 
+#[cfg(target_os = "windows")]
 /// 注册每日签到任务。async 派发：schtasks 调用约 1s，避免阻塞主线程
 #[tauri::command(async)]
 pub fn task_register(state: State<AppState>, time: String) -> Result<(), String> {
@@ -579,17 +583,13 @@ pub fn task_register(state: State<AppState>, time: String) -> Result<(), String>
 }
 
 /// 归一化路径用于比对：统一正斜杠 + 小写（Windows 路径大小写不敏感）。
+#[cfg(target_os = "windows")]
 fn norm_path(s: &str) -> String {
     s.replace('\\', "/").to_lowercase()
 }
 
 /// 基于已注册任务的 CSV /V 查询输出，校验其 /TR 是否仍指向当前安装布局。
-/// 背景：task_register 把注册时刻的 python_exe 与 python_dir 绝对路径硬编码进
-/// schtasks /TR；覆盖升级一般目录不变故仍有效，但 MSI→NSIS 迁移或手动更换
-/// 安装目录后，旧任务指向失效路径，且任务"存在"≠"可运行"（schtasks 静默失败）。
-/// 用 `/FO CSV /V` 取真实 /TR 做包含校验——CSV 单行不折行，规避 LIST 输出按
-/// 控制台宽度换行导致的误判。仅接受绝对路径参与比对。
-/// 返回 None 表示路径正常或无法校验；Some(警告文案) 为路径漂移提示。
+#[cfg(target_os = "windows")]
 fn drift_from_csv(csv_out: &str, py_exe: &str, script_path: &std::path::Path) -> Option<String> {
     let out = norm_path(csv_out);
     let script = norm_path(&script_path.to_string_lossy());
@@ -612,6 +612,7 @@ fn drift_from_csv(csv_out: &str, py_exe: &str, script_path: &std::path::Path) ->
 }
 
 /// 包装：实际发起 CSV /V 查询后做路径校验；查询失败不阻塞状态展示（返回 None）。
+#[cfg(target_os = "windows")]
 fn task_path_drift(py_exe: &str, script_path: &std::path::Path) -> Option<String> {
     let (ok, csv, _stderr) = run_schtasks(&[
         "/Query",
@@ -629,6 +630,7 @@ fn task_path_drift(py_exe: &str, script_path: &std::path::Path) -> Option<String
 }
 
 /// 查询每日签到任务状态。async 派发：schtasks 调用约 1s，避免阻塞主线程
+#[cfg(target_os = "windows")]
 #[tauri::command(async)]
 pub fn task_status(_app: AppHandle, state: State<AppState>) -> Result<String, String> {
     let (ok, stdout, stderr) =
@@ -663,6 +665,7 @@ pub fn task_status(_app: AppHandle, state: State<AppState>) -> Result<String, St
 }
 
 /// 注销每日签到任务。async 派发：schtasks 调用约 1s，避免阻塞主线程
+#[cfg(target_os = "windows")]
 #[tauri::command(async)]
 pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), String> {
     let (ok, _stdout, stderr) =
@@ -683,7 +686,180 @@ pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), S
     Ok(())
 }
 
-#[cfg(test)]
+// ---------------- macOS 定时任务（launchd LaunchAgent） ----------------
+
+/// LaunchAgent 标识与 plist 路径
+#[cfg(not(target_os = "windows"))]
+const LAUNCHD_LABEL: &str = "com.traework.assistant.daily-checkin";
+
+#[cfg(not(target_os = "windows"))]
+fn launchd_plist_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home)
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist"))
+}
+
+/// 解析 "HH:MM" 为 (hour, minute)
+#[cfg(not(target_os = "windows"))]
+fn parse_hhmm(time: &str) -> Result<(u32, u32), String> {
+    let parts: Vec<&str> = time.trim().split(':').collect();
+    if parts.len() != 2 {
+        return Err(format!("时间格式应为 HH:MM，当前为 {time}"));
+    }
+    let h: u32 = parts[0]
+        .parse()
+        .map_err(|_| format!("小时解析失败: {}", parts[0]))?;
+    let m: u32 = parts[1]
+        .parse()
+        .map_err(|_| format!("分钟解析失败: {}", parts[1]))?;
+    if h > 23 || m > 59 {
+        return Err(format!("时间超出范围: {time}"));
+    }
+    Ok((h, m))
+}
+
+/// 生成 launchd plist 内容（每日 HH:MM 运行签到脚本）
+#[cfg(not(target_os = "windows"))]
+fn build_plist(py_exe: &str, script: &std::path::Path, data_dir: &str, hour: u32, minute: u32, out_log: &str) -> String {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCHD_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{py}</string>
+        <string>{script}</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TRAEDATA_DIR</key>
+        <string>{data_dir}</string>
+        <key>PYTHONIOENCODING</key>
+        <string>utf-8</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>{hour}</integer>
+        <key>Minute</key>
+        <integer>{minute}</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{out_log}</string>
+    <key>StandardErrorPath</key>
+    <string>{out_log}</string>
+</dict>
+</plist>
+"#,
+        py = esc(py_exe),
+        script = esc(&script.to_string_lossy()),
+        data_dir = esc(data_dir),
+        out_log = esc(out_log),
+    )
+}
+
+/// 注册每日签到任务（macOS launchd）。async 派发：launchctl 调用约 1s，避免阻塞主线程
+#[cfg(not(target_os = "windows"))]
+#[tauri::command(async)]
+pub fn task_register(state: State<AppState>, time: String) -> Result<(), String> {
+    let (hour, minute) = parse_hhmm(&time)?;
+    let py = state.python_exe.clone();
+    let script = state.python_dir.join("auto_checkin.py");
+    if !script.exists() {
+        return Err(format!("找不到签到脚本: {}", script.display()));
+    }
+    let data_dir = state.data_dir.to_string_lossy().to_string();
+    let out_log = state
+        .logs_dir()
+        .join("launchd_checkin.log")
+        .to_string_lossy()
+        .to_string();
+    let plist = build_plist(&py, &script, &data_dir, hour, minute, &out_log);
+    let plist_path = launchd_plist_path();
+    if let Some(parent) = plist_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建 LaunchAgents 目录失败: {e}"))?;
+    }
+    std::fs::write(&plist_path, plist.as_bytes())
+        .map_err(|e| format!("写入 plist 失败: {e}"))?;
+    // 重新加载（旧任务可能已加载，先 unload 忽略错误）
+    let _ = Command::new("launchctl")
+        .args(["unload", "-w", &plist_path.to_string_lossy()])
+        .output();
+    let out = Command::new("launchctl")
+        .args(["load", "-w", &plist_path.to_string_lossy()])
+        .output()
+        .map_err(|e| format!("执行 launchctl 失败: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!("launchctl load 失败: {err}"));
+    }
+    Ok(())
+}
+
+/// 查询每日签到任务状态（macOS launchd）
+#[cfg(not(target_os = "windows"))]
+#[tauri::command(async)]
+pub fn task_status(_app: AppHandle, state: State<AppState>) -> Result<String, String> {
+    let plist_path = launchd_plist_path();
+    if !plist_path.exists() {
+        return Ok("未注册每日签到任务（请先在设置页点击「注册任务」）。".to_string());
+    }
+    let out = Command::new("launchctl")
+        .args(["list", LAUNCHD_LABEL])
+        .output()
+        .map_err(|e| format!("执行 launchctl 失败: {e}"))?;
+    let mut info = if out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let first = stdout.lines().next().unwrap_or("").to_string();
+        format!(
+            "每日签到任务已注册（launchd），触发时间见 plist：{}\n{}",
+            plist_path.display(),
+            first
+        )
+    } else {
+        format!(
+            "每日签到任务已注册但未加载（重启后自动生效），plist：{}",
+            plist_path.display()
+        )
+    };
+    // 路径漂移校验：plist 中的脚本路径是否与当前布局一致
+    let script = state.python_dir.join("auto_checkin.py");
+    if state.python_dir.is_absolute() {
+        let content = std::fs::read_to_string(&plist_path).unwrap_or_default();
+        let script_s = script.to_string_lossy().to_string();
+        if !content.contains(&script_s) {
+            info.push_str(&format!(
+                "\n⚠️ 签到任务指向的脚本路径已失效（可能因升级迁移了安装目录），定时签到将静默失败，请重新「注册任务」。\n当前脚本位置: {}",
+                script.display()
+            ));
+        }
+    }
+    Ok(info)
+}
+
+/// 注销每日签到任务（macOS launchd）
+#[cfg(not(target_os = "windows"))]
+#[tauri::command(async)]
+pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), String> {
+    let plist_path = launchd_plist_path();
+    if !plist_path.exists() {
+        return Ok(()); // 不存在视为已删除
+    }
+    let _ = Command::new("launchctl")
+        .args(["unload", "-w", &plist_path.to_string_lossy()])
+        .output();
+    std::fs::remove_file(&plist_path).map_err(|e| format!("删除 plist 失败: {e}"))?;
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "windows"))]
 mod task_status_tests {
     use super::{drift_from_csv, norm_path};
     use std::path::Path;
