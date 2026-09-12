@@ -102,7 +102,10 @@ pub fn run_bridge_async(
                     let success = l.contains("\"stage\":\"done\"");
                     done_emitted = true;
                     let mut payload = serde_json::json!({ "success": success, "raw": l });
-                    if let (Some(obj), Some(extra)) = (payload.as_object_mut(), done_extra.as_ref()) {
+                    if let (Some(obj), Some(extra)) = (
+                        payload.as_object_mut(),
+                        done_extra.as_ref().and_then(|v| v.as_object()),
+                    ) {
                         for (k, v) in extra {
                             obj.insert(k.clone(), v.clone());
                         }
@@ -117,7 +120,10 @@ pub fn run_bridge_async(
             let success = matches!(&exit_status, Ok(s) if s.success());
             let mut payload =
                 serde_json::json!({ "success": success, "raw": format!("exit: {:?}", exit_status) });
-            if let (Some(obj), Some(extra)) = (payload.as_object_mut(), done_extra.as_ref()) {
+            if let (Some(obj), Some(extra)) = (
+                payload.as_object_mut(),
+                done_extra.as_ref().and_then(|v| v.as_object()),
+            ) {
                 for (k, v) in extra {
                     obj.insert(k.clone(), v.clone());
                 }

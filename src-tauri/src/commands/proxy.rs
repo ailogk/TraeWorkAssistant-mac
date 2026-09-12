@@ -289,7 +289,7 @@ pub fn proxy_start(
             *safe_lock(&PREV_MAC_PROXY_STATES) = Some(states);
             // 上游若是本机同端口（上次未清理的自身代理残留），不作为上游
             if let Some(up) = &upstream {
-                if up == proxy_addr {
+                if *up == proxy_addr {
                     upstream = None;
                 }
             }
