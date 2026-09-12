@@ -182,22 +182,15 @@ pub fn proxy_start(
     if !script_path.exists() {
         return Err(format!("找不到脚本: {}", script_path.display()));
     }
-    // macOS：无内嵌 Python 运行时，检查系统 python3 的 cryptography 依赖
-    //（device_proxy.py 生成自签 CA 必需），缺失时给出安装指引。
+    // macOS：无内嵌 Python 运行时，检查 Xcode 命令行工具（python3 来源）。
+    // 注意不能用 spawn python3 的方式探测——未装 CLT 时 /usr/bin/python3 是
+    // 触发安装弹窗的 shim，spawn 会阻塞挂起，界面表现为「点了没反应」。
+    // （cryptography 依赖已移除：证书生成在缺库时自动退化为 openssl CLI，
+    //   见 device_proxy.py 的 _ensure_ca_openssl / _leaf_cert_openssl。）
     #[cfg(target_os = "macos")]
     {
-        let ok = Command::new(&state.python_exe)
-            .args(["-c", "import cryptography"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !ok {
-            return Err(
-                "Python 缺少 cryptography 依赖（生成自签证书必需）。\
-                 请在终端执行: python3 -m pip install --user cryptography \
-                 （若报权限错误可追加 --break-system-packages）后重试"
-                    .into(),
-            );
+        if !crate::state::mac_clt_installed() {
+            return Err(crate::state::mac_clt_error());
         }
     }
     // ── 端口占用预检 + 孤儿自愈（Issue #7）─────────────────────────────

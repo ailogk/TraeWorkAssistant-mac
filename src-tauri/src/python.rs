@@ -50,6 +50,14 @@ pub fn spawn_script(
     args: &[String],
     capture: bool,
 ) -> Result<std::process::Child, String> {
+    // macOS：CLT 未安装时 /usr/bin/python3 是触发安装弹窗的 shim，
+    // spawn 会阻塞挂起（签到等操作表现为「点了没反应」），先拦截并给出指引
+    #[cfg(target_os = "macos")]
+    {
+        if !crate::state::mac_clt_installed() {
+            return Err(crate::state::mac_clt_error());
+        }
+    }
     let script_path: PathBuf = state.python_dir.join(script);
     if !script_path.exists() {
         return Err(format!("找不到脚本: {}", script_path.display()));

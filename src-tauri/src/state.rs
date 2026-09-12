@@ -235,6 +235,15 @@ pub fn resolve_ps_dir() -> PathBuf {
 /// macOS/Linux 依次尝试 python3 / python。
 /// 均不可用时兜底返回 "python3"（保持原行为，由上层在启动时报错提示）。
 fn probe_python_exe() -> String {
+    // macOS：CLT 未安装时 /usr/bin/python3 是触发「安装命令行工具」弹窗的 shim，
+    // spawn 它会阻塞挂起（应用启动时探测会卡死整个启动流程）。
+    // 先用 xcode-select -p 判断（立即返回、绝不挂起），未安装则不 spawn 任何 python。
+    #[cfg(target_os = "macos")]
+    {
+        if !mac_clt_installed() {
+            return "python3".to_string();
+        }
+    }
     let candidates: &[&str] = if cfg!(target_os = "windows") {
         &["python", "python3", "py"]
     } else {
@@ -250,4 +259,25 @@ fn probe_python_exe() -> String {
         }
     }
     "python3".to_string()
+}
+
+/// macOS：Xcode 命令行工具（python3 运行环境）是否已安装。
+/// 未安装时 /usr/bin/python3 是触发安装弹窗的 shim，spawn 会阻塞挂起，
+/// 因此所有 python3 spawn 前必须先做此检查（xcode-select -p 立即返回）。
+#[cfg(target_os = "macos")]
+pub fn mac_clt_installed() -> bool {
+    Command::new("xcode-select")
+        .arg("-p")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// macOS：CLT 未安装时的统一错误提示
+#[cfg(target_os = "macos")]
+pub fn mac_clt_error() -> String {
+    "未安装 Xcode 命令行工具（本机 python3 运行环境）。\
+     请打开「终端」执行: xcode-select --install ，\
+     按提示安装完成后重试"
+        .into()
 }

@@ -797,54 +797,181 @@ import tempfile
 import threading
 _leaf_lock = threading.Lock()  # 保护叶子证书生成与缓存，避免并发同名文件覆盖导致 KEY_VALUES_MISMATCH
 
+def _crypto_available():
+    """cryptography 库是否可用（Windows 内嵌运行时已装；macOS 系统 python3
+    通常没有，此时退化为 openssl CLI 模式，每台 macOS 都自带 /usr/bin/openssl）。"""
+    try:
+        import cryptography  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _find_openssl():
+    return shutil.which("openssl")
+
+
+def _run_openssl(args, timeout=60):
+    """执行 openssl 命令；失败抛 RuntimeError（含 stderr 摘要，便于日志面板排查）。"""
+    exe = _find_openssl()
+    if not exe:
+        raise RuntimeError("找不到 openssl 命令（macOS 应自带 /usr/bin/openssl）")
+    try:
+        p = subprocess.run([exe] + args, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"openssl {args[0]} 超时（>{timeout}s）")
+    if p.returncode != 0:
+        err = p.stderr.decode("utf-8", "replace").strip()[:300]
+        raise RuntimeError(f"openssl {' '.join(args[:1])} 失败: {err}")
+    return p.stdout
+
+
+def _is_ip_addr(host):
+    import ipaddress
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _ensure_ca_openssl(cert_pem, key_pem, cer_der):
+    """openssl CLI 模式生成自签 CA（不依赖 cryptography）。
+    兼容 LibreSSL（macOS 自带）：不用 -addext，统一走 -config 扩展文件。"""
+    fd, cfg_path = tempfile.mkstemp(suffix=".cnf", prefix="ca_", dir=CA_DIR)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(
+                "[req]\n"
+                "distinguished_name = dn\n"
+                "x509_extensions = v3_ca\n"
+                "prompt = no\n"
+                "[dn]\n"
+                "CN = TraeDeviceProxyCA\n"
+                "[v3_ca]\n"
+                "basicConstraints = critical,CA:TRUE\n"
+                "keyUsage = critical,keyCertSign,cRLSign,digitalSignature\n"
+            )
+        _run_openssl([
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", key_pem, "-out", cert_pem,
+            "-days", "3650", "-config", cfg_path,
+        ])
+    finally:
+        try:
+            os.remove(cfg_path)
+        except OSError:
+            pass
+    # DER 副本（导入系统钥匙串用）
+    _run_openssl(["x509", "-in", cert_pem, "-outform", "DER", "-out", cer_der])
+    log("已生成自签 CA（openssl CLI 模式）->", cert_pem, "/", cer_der)
+
+
 def ensure_ca():
     global _ca_cert, _ca_key
     cert_pem = os.path.join(CA_DIR, "ca.crt")
     key_pem = os.path.join(CA_DIR, "ca.key")
     cer_der = os.path.join(CA_DIR, "ca.cer")
     if os.path.exists(cert_pem) and os.path.exists(key_pem):
-        from cryptography.hazmat.primitives.serialization import load_pem_private_key
-        from cryptography import x509
-        with open(cert_pem, "rb") as f:
-            _ca_cert = x509.load_pem_x509_certificate(f.read())
-        with open(key_pem, "rb") as f:
-            _ca_key = load_pem_private_key(f.read(), password=None)
-        log("已加载现有 CA:", cert_pem)
+        # 已有 CA：优先用 cryptography 加载（后续叶子证书内存签发）；
+        # cryptography 不可用时保持 None，leaf_cert 自动走 openssl CLI。
+        if _crypto_available():
+            from cryptography.hazmat.primitives.serialization import load_pem_private_key
+            from cryptography import x509
+            with open(cert_pem, "rb") as f:
+                _ca_cert = x509.load_pem_x509_certificate(f.read())
+            with open(key_pem, "rb") as f:
+                _ca_key = load_pem_private_key(f.read(), password=None)
+            log("已加载现有 CA:", cert_pem)
+        else:
+            log("已加载现有 CA（openssl CLI 模式，无需 cryptography）:", cert_pem)
         return
-    from cryptography import x509
-    from cryptography.x509.oid import NameOID
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
     os.makedirs(CA_DIR, exist_ok=True)
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subj = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "TraeDeviceProxyCA")])
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subj)
-        .issuer_name(subj)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
-        .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .add_extension(
-            x509.KeyUsage(
-                digital_signature=True, content_commitment=False, key_encipherment=False,
-                data_encipherment=False, key_agreement=False, key_cert_sign=True,
-                crl_sign=True, encipher_only=False, decipher_only=False,
-            ),
-            critical=True,
+    if _crypto_available():
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subj = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "TraeDeviceProxyCA")])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subj)
+            .issuer_name(subj)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
+            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True, content_commitment=False, key_encipherment=False,
+                    data_encipherment=False, key_agreement=False, key_cert_sign=True,
+                    crl_sign=True, encipher_only=False, decipher_only=False,
+                ),
+                critical=True,
+            )
+            .sign(key, hashes.SHA256())
         )
-        .sign(key, hashes.SHA256())
-    )
-    with open(cert_pem, "wb") as f:
-        f.write(cert.public_bytes(serialization.Encoding.PEM))
-    with open(key_pem, "wb") as f:
-        f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
-    with open(cer_der, "wb") as f:
-        f.write(cert.public_bytes(serialization.Encoding.DER))
-    _ca_cert, _ca_key = cert, key
-    log("已生成自签 CA ->", cert_pem, "/", cer_der)
+        with open(cert_pem, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+        with open(key_pem, "wb") as f:
+            f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
+        with open(cer_der, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.DER))
+        _ca_cert, _ca_key = cert, key
+        log("已生成自签 CA ->", cert_pem, "/", cer_der)
+    else:
+        _ensure_ca_openssl(cert_pem, key_pem, cer_der)
+
+def _leaf_cert_openssl(host):
+    """openssl CLI 模式签发叶子证书：生成新 key + CSR，再用 CA 签发。
+    生成约 100~300ms（RSA 2048），经 _leaf_cache 缓存后每个域名只生成一次。"""
+    ca_cert = os.path.join(CA_DIR, "ca.crt")
+    ca_key = os.path.join(CA_DIR, "ca.key")
+    safe = host.replace(":", "_")
+    fd_k, kpath = tempfile.mkstemp(suffix=".key", prefix=f"leaf_{safe}_", dir=CA_DIR)
+    os.close(fd_k)
+    fd_c, cpath = tempfile.mkstemp(suffix=".crt", prefix=f"leaf_{safe}_", dir=CA_DIR)
+    os.close(fd_c)
+    fd_csr, csrpath = tempfile.mkstemp(suffix=".csr", prefix=f"leaf_{safe}_", dir=CA_DIR)
+    os.close(fd_csr)
+    fd_ext, extpath = tempfile.mkstemp(suffix=".ext", prefix=f"leaf_{safe}_", dir=CA_DIR)
+    try:
+        with os.fdopen(fd_ext, "w") as f:
+            san = f"IP:{host}" if _is_ip_addr(host) else f"DNS:{host}"
+            f.write(
+                "[v3_ext]\n"
+                f"subjectAltName = {san}\n"
+                "basicConstraints = critical,CA:FALSE\n"
+                "keyUsage = critical,digitalSignature,keyEncipherment\n"
+                "extendedKeyUsage = serverAuth\n"
+            )
+        _run_openssl([
+            "req", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", kpath, "-out", csrpath,
+            "-subj", f"/CN={host}",
+        ])
+        _run_openssl([
+            "x509", "-req", "-in", csrpath,
+            "-CA", ca_cert, "-CAkey", ca_key, "-CAcreateserial",
+            "-out", cpath, "-days", "3650",
+            "-extfile", extpath,
+        ])
+        return cpath, kpath
+    except Exception:
+        for _p in (cpath, kpath):
+            try:
+                os.remove(_p)
+            except OSError:
+                pass
+        raise
+    finally:
+        for _p in (csrpath, extpath):
+            try:
+                os.remove(_p)
+            except OSError:
+                pass
 
 def leaf_cert(host):
     with _leaf_lock:
@@ -853,40 +980,44 @@ def leaf_cert(host):
             val = _leaf_cache.pop(host)
             _leaf_cache[host] = val
             return val
-        from cryptography import x509
-        from cryptography.x509.oid import NameOID
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        cert = (
-            x509.CertificateBuilder()
-            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)]))
-            .issuer_name(_ca_cert.subject)
-            .public_key(key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
-            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650))
-            .add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
-            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-            .sign(_ca_key, hashes.SHA256())
-        )
-        # 每次生成使用唯一临时文件，避免并发/多进程共享同名文件时
-        # 证书与私钥被交错覆盖，导致客户端握手报 KEY_VALUES_MISMATCH。
-        safe = host.replace(":", "_")
-        fd_c, cpath = tempfile.mkstemp(suffix=".crt", prefix=f"leaf_{safe}_", dir=CA_DIR)
-        fd_k, kpath = tempfile.mkstemp(suffix=".key", prefix=f"leaf_{safe}_", dir=CA_DIR)
-        try:
-            with os.fdopen(fd_c, "wb") as f:
-                f.write(cert.public_bytes(serialization.Encoding.PEM))
-            with os.fdopen(fd_k, "wb") as f:
-                f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
-        except Exception:
-            for _p in (cpath, kpath):
-                try:
-                    os.remove(_p)
-                except OSError:
-                    pass
-            raise
+        if _ca_key is None:
+            # openssl CLI 模式（cryptography 不可用 / CA 由 openssl 生成）
+            cpath, kpath = _leaf_cert_openssl(host)
+        else:
+            from cryptography import x509
+            from cryptography.x509.oid import NameOID
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            cert = (
+                x509.CertificateBuilder()
+                .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)]))
+                .issuer_name(_ca_cert.subject)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
+                .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650))
+                .add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
+                .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+                .sign(_ca_key, hashes.SHA256())
+            )
+            # 每次生成使用唯一临时文件，避免并发/多进程共享同名文件时
+            # 证书与私钥被交错覆盖，导致客户端握手报 KEY_VALUES_MISMATCH。
+            safe = host.replace(":", "_")
+            fd_c, cpath = tempfile.mkstemp(suffix=".crt", prefix=f"leaf_{safe}_", dir=CA_DIR)
+            fd_k, kpath = tempfile.mkstemp(suffix=".key", prefix=f"leaf_{safe}_", dir=CA_DIR)
+            try:
+                with os.fdopen(fd_c, "wb") as f:
+                    f.write(cert.public_bytes(serialization.Encoding.PEM))
+                with os.fdopen(fd_k, "wb") as f:
+                    f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
+            except Exception:
+                for _p in (cpath, kpath):
+                    try:
+                        os.remove(_p)
+                    except OSError:
+                        pass
+                raise
         # LRU 驱逐：超过上限时删除最旧的条目（仅移除缓存引用，临时文件留待进程退出清理）
         if len(_leaf_cache) >= _LEAF_CACHE_MAX:
             oldest = next(iter(_leaf_cache))
